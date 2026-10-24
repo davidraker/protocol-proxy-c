@@ -1,0 +1,4 @@
+build/
+bin/echo-proxy
+*.o
+*.a

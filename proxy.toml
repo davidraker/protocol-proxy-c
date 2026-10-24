@@ -1,0 +1,9 @@
+# Manifest for the C echo proxy (PROTOCOL.md section 1a). A manager runs the command with {manifest_dir} replaced
+# by this file's directory and appends the standard launch options.
+[proxy]
+name = "echo-c"
+command = ["{manifest_dir}/bin/echo-proxy"]
+header_version = 2
+
+[self_test]
+command = ["{manifest_dir}/bin/echo-proxy", "--self-test"]
