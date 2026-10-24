@@ -55,6 +55,7 @@ struct ppc_conn {
     bool has_tls_peer;
     char tls_peer[256];
     pthread_mutex_t write_lock;
+    atomic_int urgent;              /* frames waiting for or holding write_lock that are not low priority */
     pthread_t thread;
     bool has_thread;
     atomic_bool closed;             /* shutdown requested */
@@ -111,6 +112,7 @@ struct ppc_connector {
     pthread_mutex_t lock;
     pthread_cond_t cond;
     ppc_peer *peers;
+    ppc_peer *retired;              /* removed peers, kept until free (handlers may still hold them) */
     ppc_conn *conns;
     handler *handlers;
     pending *pendings;
@@ -184,6 +186,7 @@ static ppc_conn *conn_new(ppc_connector *c, int fd, bool accepted) {
     conn->fd = fd;
     conn->accepted = accepted;
     pthread_mutex_init(&conn->write_lock, NULL);
+    atomic_init(&conn->urgent, 0);
     atomic_init(&conn->refs, 1);
     atomic_init(&conn->closed, false);
     atomic_init(&conn->done, false);
@@ -261,8 +264,22 @@ static int conn_read_exact(ppc_conn *conn, uint8_t *buf, size_t len, int timeout
     return PPC_OK;
 }
 
-static int conn_write_all(ppc_conn *conn, const uint8_t *buf, size_t len) {
+#define LOW_PRIORITY_WAIT_MS 500
+
+/* Write one frame. A low-priority frame (a LOG batch) waits, up to LOW_PRIORITY_WAIT_MS, while any other frame is
+ * waiting for or holding the connection's write lock, so it never delays a request or a reply; every frame is still
+ * written whole under write_lock. */
+static int conn_write_all(ppc_conn *conn, const uint8_t *buf, size_t len, bool low_priority) {
     int timeout_ms = (int)(conn->c->io_timeout * 1000);
+    if (low_priority) {
+        double deadline = ppc_monotonic() + LOW_PRIORITY_WAIT_MS / 1000.0;
+        while (atomic_load(&conn->urgent) > 0 && !atomic_load(&conn->closed) && ppc_monotonic() < deadline) {
+            struct timespec ts = {0, 1000000L};
+            nanosleep(&ts, NULL);
+        }
+    } else {
+        atomic_fetch_add(&conn->urgent, 1);
+    }
     pthread_mutex_lock(&conn->write_lock);
     int rc = PPC_OK;
     if (atomic_load(&conn->closed)) rc = PPC_ERR_CONNECTION;
@@ -280,6 +297,7 @@ static int conn_write_all(ppc_conn *conn, const uint8_t *buf, size_t len) {
         }
     }
     pthread_mutex_unlock(&conn->write_lock);
+    if (!low_priority) atomic_fetch_sub(&conn->urgent, 1);
     return rc;
 }
 
@@ -359,6 +377,56 @@ bool ppc_peer_has_feature(ppc_peer *p, const char *feature) {
 }
 
 size_t ppc_peer_feature_count(ppc_peer *p) { return p->n_features; }
+
+char **ppc_peer_features(ppc_peer *p, size_t *count) {
+    pthread_mutex_lock(&features_lock);
+    char **copy = p->n_features ? calloc(p->n_features, sizeof *copy) : NULL;
+    size_t n = 0;
+    for (size_t i = 0; copy && i < p->n_features; i++) if ((copy[n] = ppc_strdup(p->features[i])) != NULL) n++;
+    pthread_mutex_unlock(&features_lock);
+    if (count) *count = n;
+    return copy;
+}
+
+void ppc_strings_free(char **list, size_t count) {
+    if (list == NULL) return;
+    for (size_t i = 0; i < count; i++) free(list[i]);
+    free(list);
+}
+
+bool ppc_peer_has_key(const ppc_peer *p) { return p->has_key; }
+bool ppc_peer_tls(const ppc_peer *p) { return p->tls; }
+bool ppc_peer_persistent(const ppc_peer *p, const ppc_connector *c) { return p->persistent < 0 ? c->persistent : p->persistent != 0; }
+
+int ppc_connector_set_peer_address(ppc_connector *c, ppc_peer *p, const char *address, int port) {
+    if (c == NULL || p == NULL) return PPC_ERR_INVALID;
+    char *copy = address ? ppc_strdup(address) : NULL;
+    if (address && copy == NULL) return PPC_ERR_NOMEM;
+    pthread_mutex_lock(&c->lock);
+    free(p->address);
+    p->address = copy;
+    p->port = address ? port : 0;
+    pthread_mutex_unlock(&c->lock);
+    return PPC_OK;
+}
+
+void ppc_connector_remove_peer(ppc_connector *c, const ppc_uuid *id) {
+    if (c == NULL || id == NULL) return;
+    pthread_mutex_lock(&c->lock);
+    ppc_peer *found = NULL;
+    for (ppc_peer **pp = &c->peers; *pp; pp = &(*pp)->next)
+        if (ppc_uuid_equal(&(*pp)->id, id)) { found = *pp; *pp = found->next; break; }
+    if (found) {
+        if (found->connection) {
+            conn_shutdown(found->connection);
+            conn_unref(found->connection);
+            found->connection = NULL;
+        }
+        found->next = c->retired;
+        c->retired = found;
+    }
+    pthread_mutex_unlock(&c->lock);
+}
 
 bool ppc_peer_linked(ppc_peer *p) { return conn_alive(p->connection); }
 
@@ -675,7 +743,7 @@ static void send_response(ppc_conn *conn, const ppc_header *request, ppc_peer *p
     int rc = build_frame(c, peer, "RESPONSE", request->request_id, request->version, false, conn->persistent, NULL,
                          payload, len, &frame, &frame_len);
     if (rc == PPC_OK) {
-        rc = conn_write_all(conn, frame, frame_len);
+        rc = conn_write_all(conn, frame, frame_len, false);
         free(frame);
     }
     if (rc != PPC_OK && !atomic_load(&c->stop))
@@ -816,7 +884,10 @@ static int conn_secure_accepted(ppc_conn *conn) {
         if (w <= 0) return w == 0 ? PPC_ERR_TIMEOUT : w;
         uint8_t first;
         ssize_t n = recv(conn->fd, &first, 1, MSG_PEEK);
-        if (n <= 0) return PPC_ERR_CONNECTION;
+        if (n <= 0) {
+            if (n < 0) LOG_WARNING("%s: unable to read the first byte from %s: %s", c->name, conn->name, strerror(errno));
+            return PPC_ERR_CONNECTION;
+        }
         if (first != 0x16) return PPC_OK;
     }
     int rc = ppc_tls_handshake(c->tls_server, conn->fd, true, NULL, wait_fd, c, timeout_ms, &conn->ssl);
@@ -977,7 +1048,7 @@ static int per_message_exchange(ppc_connector *c, ppc_peer *peer, const ppc_mess
     rc = build_frame(c, peer, m->method_name, request_id, version, m->response_expected, false, m->remote_id,
                      m->payload, m->payload_len, &frame, &frame_len);
     if (rc == PPC_OK) {
-        rc = conn_write_all(conn, frame, frame_len);
+        rc = conn_write_all(conn, frame, frame_len, false);
         free(frame);
     }
     if (rc == PPC_OK && m->response_expected) {
@@ -1076,7 +1147,7 @@ static int send_message(ppc_connector *c, ppc_peer *peer, const ppc_message *m, 
                     conn_track_pending(conn, request_id);
                     pthread_mutex_unlock(&c->lock);
                 }
-                rc = conn_write_all(conn, frame, frame_len);
+                rc = conn_write_all(conn, frame, frame_len, m->low_priority);
                 if (rc != PPC_OK) {
                     pthread_mutex_lock(&c->lock);
                     conn_untrack_pending(conn, request_id);
@@ -1239,6 +1310,7 @@ void ppc_connector_free(ppc_connector *c) {
     if (c == NULL) return;
     ppc_connector_stop(c);
     while (c->peers) { ppc_peer *p = c->peers; c->peers = p->next; peer_free(p); }
+    while (c->retired) { ppc_peer *p = c->retired; c->retired = p->next; peer_free(p); }
     while (c->handlers) { handler *h = c->handlers; c->handlers = h->next; free(h); }
     while (c->pendings) { pending *p = c->pendings; c->pendings = p->next; free(p->payload); free(p); }
     if (c->stop_pipe[0] >= 0) close(c->stop_pipe[0]);

@@ -14,6 +14,17 @@ struct ppc_tls_ctx {
     SSL_CTX *ctx;
 };
 
+/* One TLS session. An SSL object must never be used by two threads at once, and a persistent connection has a reader
+ * thread in SSL_read while another thread calls SSL_write (the first frame after the handshake, while the server's
+ * NewSessionTicket records are still arriving, is the usual collision), so every call into OpenSSL on the session
+ * takes its lock. The lock is never held while waiting on the socket, so a reader blocked in poll() does not stop a
+ * writer. */
+typedef struct {
+    SSL *ssl;
+    int fd;
+    pthread_mutex_t lock;
+} tls_session;
+
 static void openssl_error(char *err, size_t err_len, const char *what) {
     if (err == NULL || err_len == 0) return;
     char buf[256] = "";
@@ -99,14 +110,14 @@ void ppc_tls_ctx_free(struct ppc_tls_ctx *t) {
     free(t);
 }
 
-/* Run one non-blocking SSL operation to completion, waiting on the socket between attempts. op returns 1 on
- * success; on failure want tells what it needs. */
-static int drive(SSL *ssl, int fd, int result, ppc_wait_fn wait, void *arg, int timeout_ms, bool *eof) {
-    int e = SSL_get_error(ssl, result);
+/* Map the SSL_get_error code of a failed non-blocking operation to what the caller must do: 1 wait for the socket
+ * (events set), 0 end of stream (eof set), or a negative error. errno and the OpenSSL error queue are per thread,
+ * so they are read right after the call, before any other OpenSSL call on this thread. */
+static int classify(int e, short *events, bool *eof) {
     if (eof) *eof = false;
     switch (e) {
-    case SSL_ERROR_WANT_READ: return wait(arg, fd, POLLIN, timeout_ms);
-    case SSL_ERROR_WANT_WRITE: return wait(arg, fd, POLLOUT, timeout_ms);
+    case SSL_ERROR_WANT_READ: *events = POLLIN; return 1;
+    case SSL_ERROR_WANT_WRITE: *events = POLLOUT; return 1;
     case SSL_ERROR_ZERO_RETURN: if (eof) *eof = true; return PPC_ERR_CONNECTION;
     case SSL_ERROR_SYSCALL:
         if (eof && (errno == 0 || ERR_peek_error() == 0)) *eof = true;
@@ -118,67 +129,92 @@ static int drive(SSL *ssl, int fd, int result, ppc_wait_fn wait, void *arg, int 
     }
 }
 
+static int remaining(double deadline, int timeout_ms) {
+    if (timeout_ms < 0) return -1;
+    double left = (deadline - ppc_monotonic()) * 1000.0;
+    return left <= 0 ? 0 : (int)left + 1;
+}
+
 int ppc_tls_handshake(struct ppc_tls_ctx *t, int fd, bool server, const char *server_name, ppc_wait_fn wait,
                       void *arg, int timeout_ms, void **ssl_out) {
     if (t == NULL || ssl_out == NULL) return PPC_ERR_INVALID;
-    SSL *ssl = SSL_new(t->ctx);
-    if (ssl == NULL) return PPC_ERR_NOMEM;
-    SSL_set_fd(ssl, fd);
-    if (server) SSL_set_accept_state(ssl);
+    tls_session *s = calloc(1, sizeof *s);
+    if (s == NULL) return PPC_ERR_NOMEM;
+    s->ssl = SSL_new(t->ctx);
+    if (s->ssl == NULL) { free(s); return PPC_ERR_NOMEM; }
+    s->fd = fd;
+    pthread_mutex_init(&s->lock, NULL);
+    SSL_set_fd(s->ssl, fd);
+    if (server) SSL_set_accept_state(s->ssl);
     else {
-        SSL_set_connect_state(ssl);
-        if (server_name) SSL_set_tlsext_host_name(ssl, server_name);
+        SSL_set_connect_state(s->ssl);
+        if (server_name) SSL_set_tlsext_host_name(s->ssl, server_name);
     }
     double deadline = timeout_ms < 0 ? 0 : ppc_monotonic() + timeout_ms / 1000.0;
     for (;;) {
-        int r = SSL_do_handshake(ssl);
+        pthread_mutex_lock(&s->lock);
+        int r = SSL_do_handshake(s->ssl);
+        int e = r == 1 ? SSL_ERROR_NONE : SSL_get_error(s->ssl, r);
+        pthread_mutex_unlock(&s->lock);
         if (r == 1) break;
-        int remaining = timeout_ms < 0 ? -1 : (int)((deadline - ppc_monotonic()) * 1000);
-        if (timeout_ms >= 0 && remaining <= 0) { SSL_free(ssl); return PPC_ERR_TIMEOUT; }
-        int w = drive(ssl, fd, r, wait, arg, remaining, NULL);
-        if (w == 0) { SSL_free(ssl); return PPC_ERR_TIMEOUT; }
-        if (w < 0) { SSL_free(ssl); return w == PPC_ERR_STOPPED ? w : PPC_ERR_TLS; }
+        short events = POLLIN;
+        int c = classify(e, &events, NULL);
+        int left = remaining(deadline, timeout_ms);
+        if (c < 0 || (timeout_ms >= 0 && left <= 0)) { ppc_tls_free(s); return c < 0 ? PPC_ERR_TLS : PPC_ERR_TIMEOUT; }
+        int w = wait(arg, fd, events, left);
+        if (w == 0) { ppc_tls_free(s); return PPC_ERR_TIMEOUT; }
+        if (w < 0) { ppc_tls_free(s); return w == PPC_ERR_STOPPED ? w : PPC_ERR_TLS; }
     }
     if (!server && server_name) {
         char cn[256];
-        if (ppc_tls_peer_common_name(ssl, cn, sizeof cn) != PPC_OK || strcmp(cn, server_name) != 0) {
-            SSL_free(ssl);
+        if (ppc_tls_peer_common_name(s, cn, sizeof cn) != PPC_OK || strcmp(cn, server_name) != 0) {
+            ppc_tls_free(s);
             return PPC_ERR_TLS;
         }
     }
-    *ssl_out = ssl;
+    *ssl_out = s;
     return PPC_OK;
 }
 
 ssize_t ppc_tls_read(void *vssl, uint8_t *buf, size_t len, ppc_wait_fn wait, void *arg, int timeout_ms) {
-    SSL *ssl = vssl;
-    int fd = SSL_get_fd(ssl);
+    tls_session *s = vssl;
     double deadline = timeout_ms < 0 ? 0 : ppc_monotonic() + timeout_ms / 1000.0;
     for (;;) {
         size_t n = 0;
-        int r = SSL_read_ex(ssl, buf, len, &n);
+        pthread_mutex_lock(&s->lock);
+        int r = SSL_read_ex(s->ssl, buf, len, &n);
+        int e = r == 1 ? SSL_ERROR_NONE : SSL_get_error(s->ssl, r);
+        bool eof = false;
+        short events = POLLIN;
+        int c = r == 1 ? 0 : classify(e, &events, &eof);
+        pthread_mutex_unlock(&s->lock);
         if (r == 1) return (ssize_t)n;
-        bool eof;
-        int remaining = timeout_ms < 0 ? -1 : (int)((deadline - ppc_monotonic()) * 1000);
-        if (timeout_ms >= 0 && remaining <= 0) return PPC_ERR_TIMEOUT;
-        int w = drive(ssl, fd, r, wait, arg, remaining, &eof);
         if (eof) return 0;
+        if (c < 0) return c;
+        int left = remaining(deadline, timeout_ms);
+        if (timeout_ms >= 0 && left <= 0) return PPC_ERR_TIMEOUT;
+        int w = wait(arg, s->fd, events, left);
         if (w == 0) return PPC_ERR_TIMEOUT;
         if (w < 0) return w;
     }
 }
 
 int ppc_tls_write(void *vssl, const uint8_t *buf, size_t len, ppc_wait_fn wait, void *arg, int timeout_ms) {
-    SSL *ssl = vssl;
-    int fd = SSL_get_fd(ssl);
+    tls_session *s = vssl;
     double deadline = timeout_ms < 0 ? 0 : ppc_monotonic() + timeout_ms / 1000.0;
     while (len) {
         size_t n = 0;
-        int r = SSL_write_ex(ssl, buf, len, &n);
+        pthread_mutex_lock(&s->lock);
+        int r = SSL_write_ex(s->ssl, buf, len, &n);
+        int e = r == 1 ? SSL_ERROR_NONE : SSL_get_error(s->ssl, r);
+        short events = POLLOUT;
+        int c = r == 1 ? 0 : classify(e, &events, NULL);
+        pthread_mutex_unlock(&s->lock);
         if (r == 1) { buf += n; len -= n; continue; }
-        int remaining = timeout_ms < 0 ? -1 : (int)((deadline - ppc_monotonic()) * 1000);
-        if (timeout_ms >= 0 && remaining <= 0) return PPC_ERR_TIMEOUT;
-        int w = drive(ssl, fd, r, wait, arg, remaining, NULL);
+        if (c < 0) return c;
+        int left = remaining(deadline, timeout_ms);
+        if (timeout_ms >= 0 && left <= 0) return PPC_ERR_TIMEOUT;
+        int w = wait(arg, s->fd, events, left);
         if (w == 0) return PPC_ERR_TIMEOUT;
         if (w < 0) return w;
     }
@@ -186,7 +222,10 @@ int ppc_tls_write(void *vssl, const uint8_t *buf, size_t len, ppc_wait_fn wait, 
 }
 
 int ppc_tls_peer_common_name(void *vssl, char *out, size_t out_len) {
-    X509 *cert = SSL_get1_peer_certificate((SSL *)vssl);
+    tls_session *s = vssl;
+    pthread_mutex_lock(&s->lock);
+    X509 *cert = SSL_get1_peer_certificate(s->ssl);
+    pthread_mutex_unlock(&s->lock);
     if (cert == NULL) return PPC_ERR_TLS;
     int n = X509_NAME_get_text_by_NID(X509_get_subject_name(cert), NID_commonName, out, (int)out_len);
     X509_free(cert);
@@ -195,8 +234,12 @@ int ppc_tls_peer_common_name(void *vssl, char *out, size_t out_len) {
 
 void ppc_tls_free(void *vssl) {
     if (vssl == NULL) return;
-    SSL *ssl = vssl;
-    SSL_shutdown(ssl);      /* one non-blocking attempt at a close_notify; the socket is closed regardless */
-    SSL_free(ssl);
+    tls_session *s = vssl;
+    pthread_mutex_lock(&s->lock);
+    SSL_shutdown(s->ssl);      /* one non-blocking attempt at a close_notify; the socket is closed regardless */
+    SSL_free(s->ssl);
+    pthread_mutex_unlock(&s->lock);
+    pthread_mutex_destroy(&s->lock);
     ERR_clear_error();
+    free(s);
 }

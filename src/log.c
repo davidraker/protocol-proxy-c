@@ -1,5 +1,7 @@
 /* Log records (section 9): one JSON object per line on stderr with Python LogRecord attribute names when launched
- * by a manager (and stderr is a pipe), readable text otherwise. Thread-safe; each record is one write(2). */
+ * by a manager (and stderr is a pipe), readable text otherwise. Thread-safe; each record is one write(2).
+ * After registration a proxy may install a queue (ppc_log_set_queue): JSON records are then held for LOG batches over
+ * the socket instead of being written, bounded and rate limited, with drops counted. */
 #include "internal.h"
 
 #include <ctype.h>
@@ -15,6 +17,19 @@ static bool json_mode = false;
 static bool initialized = false;
 static double started_at = 0;
 static char process_name[128] = "echo-proxy";
+static ppc_log_queue *active_queue = NULL;      /* under log_lock */
+
+struct ppc_log_queue {
+    pthread_mutex_t lock;
+    char **records;
+    size_t len, cap, max_len;
+    double rate;                /* records per second sustained */
+    double burst;               /* bucket capacity */
+    double tokens;
+    double refilled;            /* monotonic time of the last refill */
+    long dropped;               /* since the last drain */
+    long total_dropped;
+};
 
 static bool is_pipe(int fd) {
     struct stat st;
@@ -75,6 +90,118 @@ void ppc_log_init(const char *level_name, int json_lines, const char *name) {
 
 int ppc_log_level(void) { return current_level; }
 void ppc_log_set_level(int level) { current_level = level; }
+bool ppc_log_json_mode(void) { return json_mode; }
+
+/* ---- the LOG queue -------------------------------------------------------------------------------------------- */
+ppc_log_queue *ppc_log_queue_new(size_t max_len, double rate, int burst) {
+    ppc_log_queue *q = calloc(1, sizeof *q);
+    if (q == NULL) return NULL;
+    pthread_mutex_init(&q->lock, NULL);
+    q->max_len = max_len ? max_len : PPC_LOG_QUEUE_MAX;
+    q->rate = rate > 0 ? rate : PPC_LOG_QUEUE_RATE;
+    q->burst = burst > 0 ? burst : PPC_LOG_QUEUE_BURST;
+    q->tokens = q->burst;
+    q->refilled = ppc_monotonic();
+    return q;
+}
+
+void ppc_log_queue_free(ppc_log_queue *q) {
+    if (q == NULL) return;
+    for (size_t i = 0; i < q->len; i++) free(q->records[i]);
+    free(q->records);
+    pthread_mutex_destroy(&q->lock);
+    free(q);
+}
+
+/* Under q->lock: the token bucket of section 11a. */
+static bool take_token(ppc_log_queue *q) {
+    double now = ppc_monotonic();
+    q->tokens += (now - q->refilled) * q->rate;
+    if (q->tokens > q->burst) q->tokens = q->burst;
+    q->refilled = now;
+    if (q->tokens >= 1.0) { q->tokens -= 1.0; return true; }
+    return false;
+}
+
+bool ppc_log_queue_push(ppc_log_queue *q, char *record) {
+    if (q == NULL || record == NULL) { free(record); return false; }
+    pthread_mutex_lock(&q->lock);
+    bool admitted = q->len < q->max_len && take_token(q);
+    if (admitted && q->len == q->cap) {
+        size_t cap = q->cap ? q->cap * 2 : 64;
+        if (cap > q->max_len) cap = q->max_len;
+        char **grown = realloc(q->records, cap * sizeof *grown);
+        if (grown == NULL) admitted = false;
+        else { q->records = grown; q->cap = cap; }
+    }
+    if (admitted) q->records[q->len++] = record;
+    else { q->dropped++; q->total_dropped++; free(record); }
+    pthread_mutex_unlock(&q->lock);
+    return admitted;
+}
+
+size_t ppc_log_queue_len(ppc_log_queue *q) {
+    if (q == NULL) return 0;
+    pthread_mutex_lock(&q->lock);
+    size_t n = q->len;
+    pthread_mutex_unlock(&q->lock);
+    return n;
+}
+
+long ppc_log_queue_total_dropped(ppc_log_queue *q) {
+    if (q == NULL) return 0;
+    pthread_mutex_lock(&q->lock);
+    long n = q->total_dropped;
+    pthread_mutex_unlock(&q->lock);
+    return n;
+}
+
+char **ppc_log_queue_drain(ppc_log_queue *q, size_t limit, size_t *count, long *dropped) {
+    *count = 0;
+    *dropped = 0;
+    if (q == NULL) return NULL;
+    pthread_mutex_lock(&q->lock);
+    size_t n = limit && limit < q->len ? limit : q->len;
+    char **taken = NULL;
+    if (n) {
+        taken = malloc(n * sizeof *taken);
+        if (taken == NULL) n = 0;       /* leave the records queued for the next drain */
+        else {
+            memcpy(taken, q->records, n * sizeof *taken);
+            memmove(q->records, q->records + n, (q->len - n) * sizeof *taken);
+            q->len -= n;
+        }
+    }
+    *count = n;
+    *dropped = q->dropped;
+    q->dropped = 0;
+    pthread_mutex_unlock(&q->lock);
+    return taken;
+}
+
+char *ppc_log_batch_json(char *const *records, size_t count, long dropped) {
+    /* The records are JSON objects already; join them as Python's json.dumps would. */
+    size_t total = 32 + 24;
+    for (size_t i = 0; i < count; i++) total += strlen(records[i]) + 2;
+    char *out = malloc(total);
+    if (out == NULL) return NULL;
+    char *w = out;
+    w += sprintf(w, "{\"records\": [");
+    for (size_t i = 0; i < count; i++) {
+        size_t n = strlen(records[i]);
+        if (i) { *w++ = ','; *w++ = ' '; }
+        memcpy(w, records[i], n);
+        w += n;
+    }
+    sprintf(w, "], \"dropped\": %ld}", dropped);
+    return out;
+}
+
+void ppc_log_set_queue(ppc_log_queue *q) {
+    pthread_mutex_lock(&log_lock);
+    active_queue = q;
+    pthread_mutex_unlock(&log_lock);
+}
 
 static const char *basename_of(const char *path) {
     const char *slash = strrchr(path, '/');
@@ -123,6 +250,19 @@ static void write_all(int fd, const char *data, size_t len) {
     }
 }
 
+void ppc_log_write_json_line(const char *record) {
+    size_t n = strlen(record);
+    char *out = malloc(n + 2);
+    if (out == NULL) return;
+    memcpy(out, record, n);
+    out[n] = '\n';
+    out[n + 1] = '\0';
+    pthread_mutex_lock(&log_lock);
+    write_all(STDERR_FILENO, out, n + 1);
+    pthread_mutex_unlock(&log_lock);
+    free(out);
+}
+
 void ppc_log(int level, const char *logger, const char *file, int line, const char *func, const char *fmt, ...) {
     if (level < current_level) return;
     char msg[4096];
@@ -134,6 +274,13 @@ void ppc_log(int level, const char *logger, const char *file, int line, const ch
     if (json_mode) {
         char *record = ppc_log_record_json(level, logger, file, line, func, msg);
         if (record == NULL) return;
+        pthread_mutex_lock(&log_lock);
+        if (active_queue) {             /* queued for the next LOG batch; the queue frees or keeps the record */
+            ppc_log_queue_push(active_queue, record);
+            pthread_mutex_unlock(&log_lock);
+            return;
+        }
+        pthread_mutex_unlock(&log_lock);
         size_t n = strlen(record);
         out = malloc(n + 2);
         if (out == NULL) { free(record); return; }

@@ -1,4 +1,4 @@
-# protocol-proxy C port. Targets: all (library + bin/echo-proxy), test (unit tests under ASan/UBSan, or valgrind
+# protocol-proxy C port. Targets: all (library + bin/echo-proxy + bin/conformance), test (unit tests under ASan/UBSan, or valgrind
 # with VALGRIND=1 when installed), self-test, conformance, clean.
 CC ?= gcc
 PKG_CONFIG ?= pkg-config
@@ -6,19 +6,22 @@ CSTD := -std=c11
 WARN := -Wall -Wextra -Wpedantic -Wshadow -Wpointer-arith -Wstrict-prototypes -Wmissing-prototypes -Wno-unused-parameter
 OPT ?= -O2 -g
 CFLAGS ?= $(OPT)
-CFLAGS += $(CSTD) $(WARN) -D_GNU_SOURCE -Iinclude -Isrc -pthread
+CFLAGS += $(CSTD) $(WARN) -D_GNU_SOURCE -Iinclude -Isrc -Ithird_party/tomlc99 -pthread
 PKGS := zlib openssl
 PKG_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(PKGS))
 PKG_LIBS := $(shell $(PKG_CONFIG) --libs $(PKGS))
 LDLIBS := $(PKG_LIBS) -pthread
 
-SRC := src/util.c src/headers.c src/json.c src/codec.c src/log.c src/tls.c src/connector.c src/proxy.c src/selftest.c
-OBJ := $(SRC:src/%.c=build/%.o)
+SRC := src/util.c src/headers.c src/json.c src/codec.c src/log.c src/tls.c src/connector.c src/proxy.c src/selftest.c \
+       src/manifest.c src/records.c src/authority.c src/manager.c src/conformance.c
+THIRD := third_party/tomlc99/toml.c
+OBJ := $(SRC:src/%.c=build/%.o) build/toml.o
 LIB := build/libprotocolproxy.a
 BIN := bin/echo-proxy
+CONFORMANCE := bin/conformance
 
 SAN_FLAGS := -fsanitize=address,undefined -fno-omit-frame-pointer -O1 -g
-SAN_OBJ := $(SRC:src/%.c=build/san/%.o)
+SAN_OBJ := $(SRC:src/%.c=build/san/%.o) build/san/toml.o
 TEST_BIN := build/san/test_main
 VECTORS := tests/test_vectors.json
 PYTHON ?= /home/dmr/Scratch/drivers_proxies/.venv/bin/python
@@ -26,7 +29,7 @@ PROTOCOL_PROXY_DIR ?= /home/dmr/Projects/volttron/modular/proxies/protocol-proxy
 
 .PHONY: all test self-test conformance clean
 
-all: $(BIN)
+all: $(BIN) $(CONFORMANCE)
 
 $(LIB): $(OBJ)
 	ar rcs $@ $^
@@ -34,7 +37,13 @@ $(LIB): $(OBJ)
 build/%.o: src/%.c include/ppc/ppc.h src/internal.h | build
 	$(CC) $(CFLAGS) $(PKG_CFLAGS) -c $< -o $@
 
+build/toml.o: $(THIRD) third_party/tomlc99/toml.h | build
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(BIN): tools/echo-proxy.c $(LIB) | bin
+	$(CC) $(CFLAGS) $(PKG_CFLAGS) $< $(LIB) $(LDLIBS) -o $@
+
+$(CONFORMANCE): tools/conformance.c $(LIB) | bin
 	$(CC) $(CFLAGS) $(PKG_CFLAGS) $< $(LIB) $(LDLIBS) -o $@
 
 build bin build/san:
@@ -60,10 +69,13 @@ endif
 build/san/%.o: src/%.c include/ppc/ppc.h src/internal.h | build/san
 	$(CC) $(TEST_CFLAGS) $(PKG_CFLAGS) -c $< -o $@
 
+build/san/toml.o: $(THIRD) third_party/tomlc99/toml.h | build/san
+	$(CC) $(TEST_CFLAGS) -c $< -o $@
+
 $(TEST_BIN): tests/test_main.c $(SAN_OBJ) | build/san
 	$(CC) $(TEST_CFLAGS) $(PKG_CFLAGS) $< $(SAN_OBJ) $(LDLIBS) -o $@
 
-test: $(TEST_BIN)
+test: $(TEST_BIN) $(BIN)
 	@echo "test mode: $(TEST_MODE)"
 	$(RUNNER) $(TEST_BIN) $(VECTORS)
 
@@ -74,4 +86,4 @@ conformance: $(BIN)
 	cd $(PROTOCOL_PROXY_DIR) && $(PYTHON) -m protocol_proxy.conformance $(CURDIR)/proxy.toml --echo ECHO --manager-dials --tls -v
 
 clean:
-	rm -rf build bin/echo-proxy
+	rm -rf build bin/echo-proxy bin/conformance

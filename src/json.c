@@ -445,3 +445,25 @@ char *ppc_json_dump(const ppc_json *v) {
     if (dump(&b, v) != PPC_OK || ppc_buf_append(&b, "", 1) != PPC_OK) { ppc_buf_free(&b); return NULL; }
     return (char *)b.data;
 }
+
+ppc_json *ppc_json_clone(const ppc_json *v) {
+    if (v == NULL) return NULL;
+    ppc_json *out = NULL;
+    switch (v->type) {
+    case PPC_JSON_NULL: return ppc_json_new_null();
+    case PPC_JSON_BOOL: return ppc_json_new_bool(v->boolean);
+    case PPC_JSON_NUMBER: return v->is_integer ? ppc_json_new_integer(v->integer) : ppc_json_new_number(v->number);
+    case PPC_JSON_STRING: return ppc_json_new_string(v->string);
+    case PPC_JSON_ARRAY:
+        out = ppc_json_new_array();
+        for (size_t i = 0; out && i < v->count; i++)
+            if (ppc_json_array_append(out, ppc_json_clone(v->items[i])) != PPC_OK) { ppc_json_free(out); return NULL; }
+        return out;
+    case PPC_JSON_OBJECT:
+        out = ppc_json_new_object();
+        for (size_t i = 0; out && i < v->count; i++)
+            if (ppc_json_object_set(out, v->keys[i], ppc_json_clone(v->items[i])) != PPC_OK) { ppc_json_free(out); return NULL; }
+        return out;
+    }
+    return NULL;
+}

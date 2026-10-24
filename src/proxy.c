@@ -1,5 +1,5 @@
 /* The proxy process (sections 1, 7, 8, 9): command line, stdin handshake, registration with the manager, the core
- * methods PING and SET_LOG_LEVEL, the parent-PID watch and SIGTERM handling. */
+ * methods PING and SET_LOG_LEVEL, LOG batches over the socket, the parent-PID watch and SIGTERM handling. */
 #include "internal.h"
 
 #include <ctype.h>
@@ -20,6 +20,8 @@
 #define HARD_EXIT_GRACE 15
 
 static const char *const DEFAULT_FEATURES[] = {"ping", "set_log_level", "compress", "aead-chacha20poly1305", "aead-aes256gcm"};
+#define LOG_FEATURE "log"
+#define LOG_FLUSH_POLL_MS 20
 
 struct ppc_proxy {
     ppc_proxy_options opts;
@@ -37,7 +39,17 @@ struct ppc_proxy {
     bool manager_lost;
     pthread_t watch_thread;
     bool watching;
+    ppc_log_queue *log_queue;           /* LOG batches over the socket once registered (NULL: records go to stderr) */
+    pthread_t flush_thread;
+    bool flushing;
+    atomic_bool flush_stop;
 };
+
+/* Whether this proxy will log over the socket once registered: asked to (--socket-logging, default true) and
+ * launched by a manager with stderr a pipe (the JSON-lines condition of section 9). */
+static bool socket_logging_applies(const ppc_proxy_options *options) {
+    return options->socket_logging && ppc_log_json_mode();
+}
 
 static ppc_proxy *signal_target;        /* the proxy whose SIGTERM handler is installed */
 
@@ -339,11 +351,17 @@ ppc_proxy *ppc_proxy_new(const ppc_proxy_options *options, const ppc_proxy_secre
             || (p->secrets.tls->cert = ppc_strdup(secrets->tls->cert)) == NULL
             || (p->secrets.tls->key = ppc_strdup(secrets->tls->key)) == NULL) { ppc_proxy_free(p); return NULL; }
     }
-    if (features == NULL) { features = DEFAULT_FEATURES; feature_count = sizeof DEFAULT_FEATURES / sizeof *DEFAULT_FEATURES; }
-    p->features = calloc(feature_count ? feature_count : 1, sizeof *p->features);
+    bool add_log = false;
+    if (features == NULL) {
+        features = DEFAULT_FEATURES;
+        feature_count = sizeof DEFAULT_FEATURES / sizeof *DEFAULT_FEATURES;
+        add_log = socket_logging_applies(options);      /* "log" only when LOG batches will actually be sent */
+    }
+    p->features = calloc(feature_count + 1, sizeof *p->features);
     if (p->features == NULL) { ppc_proxy_free(p); return NULL; }
     for (size_t i = 0; i < feature_count; i++)
         if ((p->features[p->n_features] = ppc_strdup(features[i])) != NULL) p->n_features++;
+    if (add_log && (p->features[p->n_features] = ppc_strdup(LOG_FEATURE)) != NULL) p->n_features++;
     ppc_connector_config cfg;
     memset(&cfg, 0, sizeof cfg);
     cfg.proxy_id = options->proxy_id;
@@ -391,7 +409,82 @@ void ppc_proxy_free(ppc_proxy *p) {
     free(p->features);
     if (p->wake_pipe[0] >= 0) close(p->wake_pipe[0]);
     if (p->wake_pipe[1] >= 0) close(p->wake_pipe[1]);
+    ppc_log_queue_free(p->log_queue);
     free(p);
+}
+
+/* ---- logging over the socket (section 9) ---------------------------------------------------------------------- */
+static void write_records_to_stderr(char **records, size_t count) {
+    for (size_t i = 0; i < count; i++) { ppc_log_write_json_line(records[i]); free(records[i]); }
+    free(records);
+}
+
+/* Ship one LOG batch (no response expected). Records the connector cannot send go to stderr instead. */
+static void flush_logs(ppc_proxy *p) {
+    size_t count = 0;
+    long dropped = 0;
+    char **records = ppc_log_queue_drain(p->log_queue, PPC_LOG_BATCH_SIZE, &count, &dropped);
+    if (count == 0 && dropped == 0) return;
+    char *payload = ppc_log_batch_json(records, count, dropped);
+    int rc = PPC_ERR_NOMEM;
+    if (payload) {
+        ppc_message m = {"LOG", (const uint8_t *)payload, strlen(payload), false, NULL, 2, true};
+        rc = ppc_connector_send(p->c, p->manager, &m);
+        free(payload);
+    }
+    if (rc != PPC_OK) write_records_to_stderr(records, count);
+    else { for (size_t i = 0; i < count; i++) free(records[i]); free(records); }
+}
+
+/* Flush every PPC_LOG_FLUSH_INTERVAL seconds, or as soon as PPC_LOG_BATCH_SIZE records are queued. */
+static void *flush_thread(void *arg) {
+    ppc_proxy *p = arg;
+    while (!atomic_load(&p->flush_stop)) {
+        double deadline = ppc_monotonic() + PPC_LOG_FLUSH_INTERVAL;
+        while (!atomic_load(&p->flush_stop) && ppc_monotonic() < deadline && ppc_log_queue_len(p->log_queue) < PPC_LOG_BATCH_SIZE) {
+            struct timespec ts = {0, LOG_FLUSH_POLL_MS * 1000000L};
+            nanosleep(&ts, NULL);
+        }
+        flush_logs(p);
+    }
+    return NULL;
+}
+
+/* After registration: route records into the queue and start the flusher. The switch itself is the first record
+ * over the socket. */
+static void start_socket_logging(ppc_proxy *p) {
+    if (!socket_logging_applies(&p->opts) || p->log_queue != NULL) return;
+    p->log_queue = ppc_log_queue_new(0, 0, 0);
+    if (p->log_queue == NULL) return;
+    atomic_store(&p->flush_stop, false);
+    if (pthread_create(&p->flush_thread, NULL, flush_thread, p) != 0) {
+        LOG_WARNING("%s: unable to start the log flusher; logging stays on stderr.", p->opts.proxy_name);
+        ppc_log_queue_free(p->log_queue);
+        p->log_queue = NULL;
+        return;
+    }
+    p->flushing = true;
+    ppc_log_set_queue(p->log_queue);
+    LOG_INFO("%s: logging over the IPC socket from here on.", p->opts.proxy_name);
+}
+
+/* At stop: records go back to stderr, the flusher ends, and whatever is still queued is drained to stderr. */
+static void stop_socket_logging(ppc_proxy *p) {
+    if (p->log_queue == NULL) return;
+    ppc_log_set_queue(NULL);
+    if (p->flushing) {
+        atomic_store(&p->flush_stop, true);
+        pthread_join(p->flush_thread, NULL);
+        p->flushing = false;
+    }
+    size_t count = 0;
+    long dropped = 0;
+    char **records = ppc_log_queue_drain(p->log_queue, 0, &count, &dropped);
+    write_records_to_stderr(records, count);
+    long total = ppc_log_queue_total_dropped(p->log_queue);
+    if (total) LOG_WARNING("%s: %ld log record(s) were dropped by the LOG queue (rate or size limit).", p->opts.proxy_name, total);
+    ppc_log_queue_free(p->log_queue);
+    p->log_queue = NULL;
 }
 
 /* ---- lifecycle ------------------------------------------------------------------------------------------------ */
@@ -537,7 +630,7 @@ static bool send_registration(ppc_proxy *p) {
     for (int attempt = 1; attempt <= REGISTRATION_ATTEMPTS && !atomic_load(&p->stop); attempt++) {
         char *payload = registration_payload(p);
         if (payload == NULL) return false;
-        ppc_message m = {"REGISTER_PEER", (const uint8_t *)payload, strlen(payload), true, NULL, 2};
+        ppc_message m = {"REGISTER_PEER", (const uint8_t *)payload, strlen(payload), true, NULL, 2, false};
         uint8_t *reply = NULL;
         size_t reply_len = 0;
         int rc = ppc_connector_request(p->c, p->manager, &m, REGISTRATION_TIMEOUT, &reply, &reply_len);
@@ -585,6 +678,7 @@ int ppc_proxy_run(ppc_proxy *p) {
     p->watching = true;
     bool registered = send_registration(p);
     if (registered) {
+        start_socket_logging(p);
         /* Serve until stopped: the watch thread stops the connector on SIGTERM, a lost parent or ppc_proxy_stop. */
         while (!atomic_load(&p->stop) && !ppc_connector_stopping(p->c)) stoppable_sleep(p, 0.5);
     }
@@ -592,6 +686,7 @@ int ppc_proxy_run(ppc_proxy *p) {
     wake(p, 'x');
     pthread_join(p->watch_thread, NULL);
     p->watching = false;
+    stop_socket_logging(p);
     ppc_connector_stop(p->c);
     signal_target = NULL;
     if (p->sigterm || p->manager_lost) return 0;
