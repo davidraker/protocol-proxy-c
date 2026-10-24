@@ -3,6 +3,7 @@
  * encryption, compression, the large-frame rule). Run by `make test` under the sanitizers. */
 #include "ppc/ppc.h"
 
+#include <malloc.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -379,6 +380,44 @@ static void test_loopback(bool persistent, bool encrypted) {
     ppc_connector_free(b);
 }
 
+/* Without a leak checker installed, watch the heap: many request/response cycles must not grow it. */
+static void test_heap_growth(void) {
+    ppc_uuid id_a, id_b, tok_a, tok_b;
+    ppc_uuid_random(&id_a); ppc_uuid_random(&id_b); ppc_uuid_random(&tok_a); ppc_uuid_random(&tok_b);
+    uint8_t key[32];
+    ppc_random_bytes(key, 32);
+    ppc_connector *a = make_connector("A", &id_a, &tok_a, false);
+    ppc_connector *b = make_connector("B", &id_b, &tok_b, false);
+    char addr_a[64];
+    int port_a = 0;
+    ppc_connector_local_address(a, addr_a, sizeof addr_a, &port_a);
+    echo_state state_a = {0};
+    ppc_connector_register_handler(a, "ECHO", NULL, echo_handler, &state_a, true);
+    ppc_connector_add_peer(a, &id_b, &tok_b, NULL, 0, key, -1, false);
+    ppc_peer *a_on_b = ppc_connector_add_peer(b, &id_a, &tok_a, addr_a, port_a, key, 1, false);
+    const char *compress_features[] = {"compress"};
+    ppc_peer_set_features(a_on_b, compress_features, 1);
+    char *text = malloc(10001);
+    memset(text, 'q', 10000);
+    text[10000] = 0;
+    for (int round = 0; round < 2; round++) {
+        size_t before = mallinfo2().uordblks;
+        for (int i = 0; i < 300; i++) {
+            uint8_t *reply = NULL;
+            size_t len = 0;
+            int rc = request_text(b, a_on_b, i % 2 ? "ECHO" : "NOPE", i % 3 ? text : "{}", 2, &reply, &len);
+            if (rc != PPC_OK) { CHECK(false, "heap test request %d failed: %s", i, ppc_strerror(rc)); break; }
+            free(reply);
+        }
+        size_t after = mallinfo2().uordblks;
+        /* Round 0 warms caches (OpenSSL, zlib, thread bookkeeping); round 1 must be flat. */
+        if (round == 1) CHECK(after <= before + 16384, "heap grew by %zd bytes over 300 requests", (ssize_t)after - (ssize_t)before);
+    }
+    free(text);
+    ppc_connector_free(a);
+    ppc_connector_free(b);
+}
+
 static int main_vectors(const char *path) {
     int failures_in_vectors = ppc_selftest_vectors(path, stderr);
     CHECK(failures_in_vectors == 0, "vectors: %d failure(s)", failures_in_vectors);
@@ -397,6 +436,7 @@ int main(int argc, char **argv) {
     test_loopback(true, false);
     test_loopback(false, true);
     test_loopback(true, true);
+    test_heap_growth();
     fprintf(stderr, "%d checks, %d failure(s)\n", checks, failures);
     return failures ? 1 : 0;
 }

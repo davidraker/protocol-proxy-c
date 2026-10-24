@@ -59,6 +59,8 @@ struct ppc_tls_ctx *ppc_tls_ctx_new(const ppc_tls_material *m, bool server, char
     SSL_CTX_set_min_proto_version(t->ctx, TLS1_3_VERSION);
     SSL_CTX_set_verify(t->ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, NULL);
     SSL_CTX_set_mode(t->ctx, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+    /* A peer that closes the socket without a close_notify (the Python manager does on stop) is an EOF, not an error. */
+    SSL_CTX_set_options(t->ctx, SSL_OP_IGNORE_UNEXPECTED_EOF);
     /* CA certificates (one or more PEM blocks). */
     BIO *bio = BIO_new_mem_buf(m->ca, -1);
     X509_STORE *store = SSL_CTX_get_cert_store(t->ctx);
