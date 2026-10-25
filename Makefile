@@ -24,8 +24,10 @@ SAN_FLAGS := -fsanitize=address,undefined -fno-omit-frame-pointer -O1 -g
 SAN_OBJ := $(SRC:src/%.c=build/san/%.o) build/san/toml.o
 TEST_BIN := build/san/test_main
 VECTORS := tests/test_vectors.json
-PYTHON ?= /home/dmr/Scratch/drivers_proxies/.venv/bin/python
-PROTOCOL_PROXY_DIR ?= /home/dmr/Projects/volttron/modular/proxies/protocol-proxy
+# Override on the command line: PYTHON is an interpreter with the Python protocol-proxy installed (for the
+# conformance harness), PROTOCOL_PROXY_DIR its checkout (for the shared test vectors).
+PYTHON ?= python3
+PROTOCOL_PROXY_DIR ?= ../protocol-proxy
 
 .PHONY: all test self-test conformance clean
 
